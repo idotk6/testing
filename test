@@ -662,14 +662,21 @@ local function storeCachedApiResult(key, result)
     end
 end
 
-local function markHighUsage()
+local function markHighUsage(reason)
     local now = apiNow()
+
     sharedApi.PrimaryCooldownUntil = math.max(
         tonumber(sharedApi.PrimaryCooldownUntil) or 0,
         now + API_PRIMARY_COOLDOWN
     )
+
     sharedApi.HighUsageUntil = sharedApi.PrimaryCooldownUntil
     state.ApiHighUsageUntil = sharedApi.PrimaryCooldownUntil
+
+    warn(
+        "[Chess] PRIMARY API COOLDOWN STARTED | "
+        .. tostring(reason or "unknown")
+    )
 end
 
 local function formatCooldown(seconds)
@@ -943,7 +950,14 @@ local function requestStockfish(payload)
         local responseBody = response.Body or response.body or ""
 
         if statusCode == 429 or isHighUsageText(responseBody) then
-            markHighUsage()
+            markHighUsage(
+    "HTTP "
+        .. tostring(statusCode)
+        .. " | kind="
+        .. tostring(requestKind)
+        .. " | body="
+        .. string.sub(tostring(responseBody), 1, 200)
+)
             return requestStockfishOnline(payload, true)
         end
 
@@ -965,8 +979,13 @@ local function requestStockfish(payload)
 
         if decoded.error then
             local apiError = tostring(decoded.error)
-            if isHighUsageText(apiError) then
-                markHighUsage()
+           if isHighUsageText(apiError) then
+    markHighUsage(
+        "decoded.error | kind="
+            .. tostring(requestKind)
+            .. " | "
+            .. apiError
+    )
                 return requestStockfishOnline(payload, true)
             end
             if string.find(apiError, "FEN", 1, true) then
@@ -977,8 +996,13 @@ local function requestStockfish(payload)
 
         if decoded.type == "error" then
             local apiError = tostring(decoded.text or decoded.error or "unknown error")
-            if isHighUsageText(apiError) then
-                markHighUsage()
+           if isHighUsageText(apiError) then
+    markHighUsage(
+        "decoded.type=error | kind="
+            .. tostring(requestKind)
+            .. " | "
+            .. apiError
+    )
                 return requestStockfishOnline(payload, true)
             end
             if string.find(apiError, "FEN", 1, true)
@@ -998,7 +1022,12 @@ local function requestStockfish(payload)
     if primaryEngineAttempted then
         -- Any error from the primary chess-api.com request
         -- starts the full primary-engine cooldown.
-        markHighUsage()
+          markHighUsage(
+        "exception | kind="
+            .. tostring(requestKind)
+            .. " | "
+            .. message
+    )
     end
 
     sharedApi.NextRequestAt = math.max(
