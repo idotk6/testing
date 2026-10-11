@@ -1,4 +1,3 @@
---[[
 
 --// =========================================================
 --// VAMPAuth Key System
@@ -243,8 +242,6 @@ end
 --// VAMPAuth passed.
 --// Your existing final.lua starts BELOW this point.
 --// =========================================================
-
-]]
 
 
 local env = getgenv()
