@@ -1985,14 +1985,6 @@ end
         task.wait(active and 0.2 or 0.5)
     end
 end
-            if string.find(searchStatusLabel.Text or "", "API cooldown (Temporarily using a different engine):", 1, true) then
-                searchStatusLabel.Text = "Ready"
-            end
-        end
-
-        task.wait(active and 0.2 or 0.5)
-    end
-end
 
 task.spawn(updateCooldownUI)
 
