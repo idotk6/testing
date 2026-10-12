@@ -573,12 +573,7 @@ if state.AutoRanked then
     state.Enabled = true
 end
 
--- If a previous server already triggered the primary API cooldown, start this
--- server with Auto Ranked temporarily suspended. The user's preference remains
--- stored separately and will be restored when the cooldown expires.
-if apiNow() < (tonumber(sharedApi.PrimaryCooldownUntil) or 0) then
-    state.AutoRanked = false
-end
+
 
 config.AutoPlay = state.Enabled
 config.AutoRanked = state.AutoRankedUserSetting
@@ -942,14 +937,14 @@ local function applyApiCooldownState()
     local cooldownUntil = tonumber(sharedApi.PrimaryCooldownUntil) or 0
     state.ApiHighUsageUntil = cooldownUntil
 
+    state.AutoRanked = state.AutoRankedUserSetting == true
+
     if cooldownUntil > now then
-        state.AutoRanked = false
         return true, cooldownUntil - now
     end
-
-    state.AutoRanked = state.AutoRankedUserSetting == true
     return false, 0
 end
+
 
 local function requestStockfishOnline(payload, laneAlreadyHeld)
     if type(requestFunction) ~= "function" then
@@ -1724,7 +1719,7 @@ autoRankedToggle = makeToggle(100, "Auto Ranked Loop", state.AutoRankedUserSetti
     -- Exactly the working loop's direct ON/OFF behavior, except that a primary
     -- API cooldown temporarily suppresses the effective state without changing
     -- the saved preference.
-    state.AutoRanked = primaryApiOnCooldown() and false or enabled
+state.AutoRanked = enabled
 
     if state.AutoRanked then
         state.Enabled = true
@@ -1767,9 +1762,7 @@ local cooldownExplanation = makeLabel(
     main,
     UDim2.fromOffset(16, 218),
     UDim2.fromOffset(350, 45),
-    "API cooldown temporarily pauses Auto Ranked. " ..
-    "It will automatically turn back on when the cooldown ends " ..
-    "if you had Auto Ranked enabled before the cooldown.",
+    "During API cooldown a backup engine is used and Auto Ranked keeps running.",
     10,
     Color3.fromRGB(130, 138, 155)
 )
@@ -1977,21 +1970,21 @@ local function updateCooldownUI()
 end
         if active then
             searchStatusLabel.Text = "API cooldown (Temporarily using a different engine): " .. formatCooldown(remaining)
+        elseif string.find(searchStatusLabel.Text or "", "API cooldown (Temporarily using a different engine):", 1, true) then
+            searchStatusLabel.Text = "Ready"
+        end
 
-            if autoRankedToggle then
-                autoRankedToggle.value = false
-                autoRankedToggle.button.Text = "OFF"
-                autoRankedToggle.button.BackgroundColor3 = Color3.fromRGB(48, 50, 59)
-            end
-        else
-            if autoRankedToggle then
-                autoRankedToggle.value = state.AutoRanked
-                autoRankedToggle.button.Text = state.AutoRanked and "ON" or "OFF"
-                autoRankedToggle.button.BackgroundColor3 = state.AutoRanked
-                    and Color3.fromRGB(42, 160, 105)
-                    or Color3.fromRGB(48, 50, 59)
-            end
+        if autoRankedToggle then
+            autoRankedToggle.value = state.AutoRanked
+            autoRankedToggle.button.Text = state.AutoRanked and "ON" or "OFF"
+            autoRankedToggle.button.BackgroundColor3 = state.AutoRanked
+                and Color3.fromRGB(42, 160, 105)
+                or Color3.fromRGB(48, 50, 59)
+        end
 
+        task.wait(active and 0.2 or 0.5)
+    end
+end
             if string.find(searchStatusLabel.Text or "", "API cooldown (Temporarily using a different engine):", 1, true) then
                 searchStatusLabel.Text = "Ready"
             end
@@ -2444,8 +2437,7 @@ local function queueRanked()
 end
 
 EndGame.OnClientEvent:Connect(function(matchId)
-    local cooldownPausedRanked = state.AutoRankedUserSetting and primaryApiOnCooldown()
-    if (not state.AutoRanked and not cooldownPausedRanked) or state.Destroyed then
+    if not state.AutoRanked or state.Destroyed then
         return
     end
     if state.AutoRankedBusy then
@@ -2478,20 +2470,18 @@ EndGame.OnClientEvent:Connect(function(matchId)
         -- Keep the source loop's exact cleanup/state transitions. The online
         -- version additionally hops servers after the cleanup; during a primary
         -- API cooldown that hop is deferred until recovery.
-        if state.AutoRankedUserSetting and primaryApiOnCooldown() then
-            state.RankedPostGame = true
-        elseif state.AutoRankedUserSetting then
-            state.RankedPostGame = false
-            state.RankedTeleporting = true
-            local callOk, result = pcall(function()
-                return hopToMostPopulatedServer()
-            end)
-            if not callOk or not result then
-                state.RankedTeleporting = false
-            end
-        else
-            state.RankedPostGame = false
-        end
+       if state.AutoRankedUserSetting then
+    state.RankedPostGame = false
+    state.RankedTeleporting = true
+    local callOk, result = pcall(function()
+        return hopToMostPopulatedServer()
+    end)
+    if not callOk or not result then
+        state.RankedTeleporting = false
+    end
+else
+    state.RankedPostGame = false
+end
 
         task.wait(0.5)
         state.AutoRankedBusy = false
@@ -2507,9 +2497,10 @@ TeleportService.TeleportInitFailed:Connect(function()
     state.AutoRankedBusy = false
     state.NextRankedAttempt = os.clock() + 2
 
-    if state.AutoRankedUserSetting and not primaryApiOnCooldown() then
-        state.AutoRanked = true
-    end
+  if state.AutoRankedUserSetting then
+    state.AutoRanked = true
+end
+
 end)
 
 state.Destroy = function()
