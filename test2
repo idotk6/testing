@@ -386,6 +386,7 @@ end
 local config = {
     AutoPlay = false,
     AutoRanked = false,
+    HighlightBestMove = false,
     SimulateMoveDelay = false,
     MoveDelayMode = "Random",
     MoveDelayMin = 1.0,
@@ -421,6 +422,10 @@ local function loadConfig()
 
     if type(saved.AutoPlay) == "boolean" then
         config.AutoPlay = saved.AutoPlay
+    end
+
+    if type(saved.HighlightBestMove) == "boolean" then
+        config.HighlightBestMove = saved.HighlightBestMove
     end
 
     if type(saved.AutoRanked) == "boolean" then
@@ -479,6 +484,10 @@ if type(runtimeConfig) == "table" then
         config.AutoPlay = runtimeConfig.AutoPlay
     end
 
+    if type(runtimeConfig.HighlightBestMove) == "boolean" then
+        config.HighlightBestMove = runtimeConfig.HighlightBestMove
+    end
+
     if type(runtimeConfig.AutoRanked) == "boolean" then
         config.AutoRanked = runtimeConfig.AutoRanked
     end
@@ -513,6 +522,7 @@ local function saveConfig()
     local payload = {
         AutoPlay = config.AutoPlay,
         AutoRanked = config.AutoRanked,
+        HighlightBestMove = config.HighlightBestMove,
         SimulateMoveDelay = config.SimulateMoveDelay,
         MoveDelayMode = config.MoveDelayMode,
         MoveDelayMin = config.MoveDelayMin,
@@ -530,6 +540,7 @@ local function saveConfig()
     executorEnv.__CHESS_CONFIG = {
         AutoPlay = payload.AutoPlay,
         AutoRanked = payload.AutoRanked,
+        HighlightBestMove = payload.HighlightBestMove,
         SimulateMoveDelay = payload.SimulateMoveDelay,
         MoveDelayMode = payload.MoveDelayMode,
         MoveDelayMin = payload.MoveDelayMin,
@@ -567,6 +578,7 @@ end
 
 local state = {
     Enabled = config.AutoPlay,
+    HighlightBestMove = config.HighlightBestMove,
     SimulateMoveDelay = config.SimulateMoveDelay,
     -- Persistent user preference. `AutoRanked` below is the effective runtime
     -- state and may be temporarily suspended while the primary API cools down.
@@ -634,6 +646,7 @@ config.AutoRanked = state.AutoRankedUserSetting
 executorEnv.__CHESS_CONFIG = {
     AutoPlay = config.AutoPlay,
     AutoRanked = state.AutoRankedUserSetting,
+    HighlightBestMove = state.HighlightBestMove,
     MenuKeyCode = config.MenuKeyCode,
 }
 
@@ -643,6 +656,7 @@ Players.LocalPlayer.OnTeleport:Connect(function()
     -- Capture the live UI state immediately before EVERY teleport.
     config.AutoPlay = state.Enabled
     config.AutoRanked = state.AutoRankedUserSetting
+    config.HighlightBestMove = state.HighlightBestMove
     config.MenuKeyCode = state.MenuKeyCode.Name
 
     saveConfig()
@@ -1646,6 +1660,393 @@ local function detectMove(previousSnapshot, currentSnapshot)
     }
 end
 
+-- Best-move visual indicator. It is display-only and is intentionally
+-- independent from Auto Play / Auto Ranked.
+local Workspace = game:GetService("Workspace")
+local activeMoveHighlight = {
+    key = nil,
+    targetHighlight = nil,
+    sourceHighlight = nil,
+    marker = nil,
+    markerOutline = nil,
+    fallbackBillboard = nil,
+}
+
+local function clearMoveHighlight()
+    for _, objectName in ipairs({
+        "targetHighlight", "sourceHighlight", "markerOutline",
+        "marker", "fallbackBillboard",
+    }) do
+        local object = activeMoveHighlight[objectName]
+        if object then
+            pcall(function() object:Destroy() end)
+            activeMoveHighlight[objectName] = nil
+        end
+    end
+    activeMoveHighlight.key = nil
+end
+
+local function isVisualInstance(value)
+    return typeof(value) == "Instance"
+        and (value:IsA("BasePart") or value:IsA("Model"))
+end
+
+local function getPieceVisual(piece)
+    if isVisualInstance(piece) then
+        return piece
+    end
+    if type(piece) ~= "table" then
+        return nil
+    end
+
+    local preferredKeys = {
+        "Model", "model", "Instance", "instance", "Part", "part",
+        "Visual", "visual", "Object", "object", "PieceModel", "pieceModel",
+        "ModelInstance", "modelInstance", "PrimaryPart", "primaryPart",
+        "Figure", "figure", "Mesh", "mesh",
+    }
+    for _, keyName in ipairs(preferredKeys) do
+        local ok, value = pcall(function() return piece[keyName] end)
+        if ok and isVisualInstance(value) then
+            return value
+        end
+    end
+
+    -- Some game builds store the rendered model under a differently named
+    -- field. Use a shallow scan only; do not traverse back into the whole board.
+    for _, value in pairs(piece) do
+        if isVisualInstance(value) then
+            return value
+        end
+    end
+    return nil
+end
+
+local function getVisualBasePosition(visual)
+    if not isVisualInstance(visual) then
+        return nil
+    end
+
+    local ok, center, size = pcall(function()
+        if visual:IsA("BasePart") then
+            return visual.Position, visual.Size
+        end
+        local cf, bounds = visual:GetBoundingBox()
+        return cf.Position, bounds
+    end)
+    if not ok or not center or not size then
+        return nil
+    end
+
+    -- The bottom of each rendered piece is a better estimate of the board
+    -- surface than its pivot, which can differ across piece models.
+    return Vector3.new(center.X, center.Y - size.Y * 0.5, center.Z)
+end
+
+local function squareContainerCandidate(container, notation, x, rank)
+    if type(container) ~= "table" then
+        return nil
+    end
+
+    local ok, value = pcall(function()
+        return container[notation]
+            or container[string.upper(notation)]
+            or (type(container[x]) == "table" and container[x][rank])
+            or (type(container[rank]) == "table" and container[rank][x])
+    end)
+    if ok and isVisualInstance(value) then
+        return value
+    end
+    return nil
+end
+
+local function findNamedSquare(board, notation)
+    local grid = notationToSquare(notation)
+    local x, rank = grid[1], grid[2]
+
+    -- First inspect board-owned tile tables if this game's client exposes them.
+    for _, fieldName in ipairs({
+        "squares", "Squares", "tiles", "Tiles", "boardSquares",
+        "BoardSquares", "squareParts", "SquareParts", "spaces", "Spaces",
+    }) do
+        local ok, container = pcall(function() return board[fieldName] end)
+        if ok then
+            local candidate = squareContainerCandidate(container, notation, x, rank)
+            if candidate then
+                return candidate
+            end
+        end
+    end
+
+    local compactTarget = string.lower(notation)
+    local nameForms = {
+        [compactTarget] = true,
+        ["tile" .. compactTarget] = true,
+        ["square" .. compactTarget] = true,
+        ["boardtile" .. compactTarget] = true,
+        ["boardsquare" .. compactTarget] = true,
+        [compactTarget .. "tile"] = true,
+        [compactTarget .. "square"] = true,
+    }
+
+    local descendants = Workspace:GetDescendants()
+    for _, object in ipairs(descendants) do
+        if object:IsA("BasePart") or object:IsA("Model") then
+            local name = string.lower(object.Name):gsub("[^%w]", "")
+            if nameForms[name] then
+                return object
+            end
+
+            local attributes = object:GetAttributes()
+            for _, attrName in ipairs({ "Notation", "Square", "Coordinate", "ChessSquare" }) do
+                local attr = attributes[attrName]
+                if type(attr) == "string" and string.lower(attr) == compactTarget then
+                    return object
+                end
+            end
+            local fileAttr = attributes.File or attributes.file
+            local rankAttr = tonumber(attributes.Rank or attributes.rank)
+            if rankAttr == rank then
+                local fileNumber
+                if type(fileAttr) == "string" then
+                    local fileCode = string.byte(string.lower(fileAttr), 1)
+                    if fileCode and fileCode >= 97 and fileCode <= 104 then
+                        fileNumber = fileCode - 96
+                    end
+                else
+                    fileNumber = tonumber(fileAttr)
+                end
+                if fileNumber and fileNumber >= 1 and fileNumber <= 8
+                    and (9 - fileNumber) == x then
+                    return object
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function solveBoardCoordinate(samples, coordinateName)
+    local n = #samples
+    if n < 4 then
+        return nil
+    end
+
+    local meanX, meanY, meanP = 0, 0, 0
+    for _, sample in ipairs(samples) do
+        meanX = meanX + sample.x
+        meanY = meanY + sample.y
+        meanP = meanP + sample.position[coordinateName]
+    end
+    meanX, meanY, meanP = meanX / n, meanY / n, meanP / n
+
+    local xx, yy, xy, xp, yp = 0, 0, 0, 0, 0
+    for _, sample in ipairs(samples) do
+        local dx, dy = sample.x - meanX, sample.y - meanY
+        local dp = sample.position[coordinateName] - meanP
+        xx = xx + dx * dx
+        yy = yy + dy * dy
+        xy = xy + dx * dy
+        xp = xp + dx * dp
+        yp = yp + dy * dp
+    end
+
+    local determinant = xx * yy - xy * xy
+    if math.abs(determinant) < 0.001 then
+        return nil
+    end
+
+    local a = (xp * yy - yp * xy) / determinant
+    local b = (yp * xx - xp * xy) / determinant
+    local c = meanP - a * meanX - b * meanY
+    return { a = a, b = b, c = c }
+end
+
+local function estimateSquareCFrame(board, notation)
+    local samples, seen = {}, {}
+    for _, listName in ipairs({ "whitePieces", "blackPieces" }) do
+        local ok, pieces = pcall(function() return board[listName] end)
+        if ok and type(pieces) == "table" then
+            for _, piece in pairs(pieces) do
+                if not seen[piece] and type(piece) == "table" and type(piece.position) == "table" then
+                    seen[piece] = true
+                    local gx, gy = tonumber(piece.position[1]), tonumber(piece.position[2])
+                    local visual = getPieceVisual(piece)
+                    local position = visual and getVisualBasePosition(visual) or nil
+                    if gx and gy and position then
+                        samples[#samples + 1] = { x = gx, y = gy, position = position }
+                    end
+                end
+            end
+        end
+    end
+
+    local fitX = solveBoardCoordinate(samples, "X")
+    local fitY = solveBoardCoordinate(samples, "Y")
+    local fitZ = solveBoardCoordinate(samples, "Z")
+    if not fitX or not fitY or not fitZ then
+        return nil
+    end
+
+    local square = notationToSquare(notation)
+    local gx, gy = square[1], square[2]
+    local center = Vector3.new(
+        fitX.c + fitX.a * gx + fitX.b * gy,
+        fitY.c + fitY.a * gx + fitY.b * gy,
+        fitZ.c + fitZ.a * gx + fitZ.b * gy
+    )
+    local axisX = Vector3.new(fitX.a, fitY.a, fitZ.a)
+    local axisY = Vector3.new(fitX.b, fitY.b, fitZ.b)
+    if axisX.Magnitude < 0.01 or axisY.Magnitude < 0.01 then
+        return nil
+    end
+
+    local right = axisX.Unit
+    local up = axisY:Cross(right)
+    if up.Magnitude < 0.01 then
+        return nil
+    end
+    up = up.Unit
+    if up.Y < 0 then
+        up = -up
+    end
+    local back = right:Cross(up)
+    if back.Magnitude < 0.01 then
+        return nil
+    end
+    back = back.Unit
+
+    local cframe = CFrame.fromMatrix(center + up * 0.045, right, up, back)
+    return cframe, axisX.Magnitude, axisY.Magnitude
+end
+
+local function findBillboardAnchor(visual)
+    if not isVisualInstance(visual) then
+        return nil
+    end
+    if visual:IsA("BasePart") then
+        return visual
+    end
+    if visual.PrimaryPart then
+        return visual.PrimaryPart
+    end
+    return visual:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function refreshBestMoveHighlight(recommendation)
+    if not state.HighlightBestMove then
+        clearMoveHighlight()
+        return
+    end
+
+    local board = MatchClient.currentMatch
+    if not recommendation or not board
+        or recommendation.board ~= board
+        or recommendation.key ~= boardKey(board)
+        or type(recommendation.from) ~= "string"
+        or type(recommendation.to) ~= "string" then
+        clearMoveHighlight()
+        return
+    end
+
+    local key = tostring(board.id) .. ":" .. tostring(recommendation.key)
+        .. ":" .. recommendation.from .. recommendation.to
+    if activeMoveHighlight.key == key then
+        return
+    end
+    clearMoveHighlight()
+    activeMoveHighlight.key = key
+
+    local target = findNamedSquare(board, recommendation.to)
+    if target then
+        local targetHighlight = Instance.new("Highlight")
+        targetHighlight.Name = "ChessBestMoveTargetHighlight"
+        targetHighlight.Adornee = target
+        targetHighlight.FillColor = Color3.fromRGB(55, 255, 125)
+        targetHighlight.OutlineColor = Color3.fromRGB(205, 255, 220)
+        targetHighlight.FillTransparency = 0.5
+        targetHighlight.OutlineTransparency = 0.05
+        targetHighlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        targetHighlight.Parent = Workspace
+        activeMoveHighlight.targetHighlight = targetHighlight
+    else
+        local cframe, stepX, stepY = estimateSquareCFrame(board, recommendation.to)
+        if cframe and stepX and stepY then
+            local marker = Instance.new("Part")
+            marker.Name = "ChessBestMoveSquareMarker"
+            marker.Anchored = true
+            marker.CanCollide = false
+            marker.CanTouch = false
+            marker.CanQuery = false
+            marker.CastShadow = false
+            marker.Material = Enum.Material.Neon
+            marker.Color = Color3.fromRGB(55, 255, 125)
+            marker.Transparency = 0.55
+            marker.Size = Vector3.new(math.max(0.1, stepX * 0.84), 0.045, math.max(0.1, stepY * 0.84))
+            marker.CFrame = cframe
+            marker.Parent = Workspace
+            activeMoveHighlight.marker = marker
+
+            local outline = Instance.new("SelectionBox")
+            outline.Name = "ChessBestMoveSquareOutline"
+            outline.Adornee = marker
+            outline.Color3 = Color3.fromRGB(205, 255, 220)
+            outline.LineThickness = 0.045
+            outline.SurfaceTransparency = 1
+            outline.Parent = marker
+            activeMoveHighlight.markerOutline = outline
+        end
+    end
+
+    -- Also outline the piece to move, so the source of the suggested move is
+    -- immediately clear even when the destination is an empty square.
+    local sourceVisual = getPieceVisual(recommendation.piece)
+    if sourceVisual then
+        local sourceHighlight = Instance.new("Highlight")
+        sourceHighlight.Name = "ChessBestMoveSourceHighlight"
+        sourceHighlight.Adornee = sourceVisual
+        sourceHighlight.FillColor = Color3.fromRGB(255, 204, 65)
+        sourceHighlight.OutlineColor = Color3.fromRGB(255, 245, 190)
+        sourceHighlight.FillTransparency = 0.68
+        sourceHighlight.OutlineTransparency = 0.05
+        sourceHighlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        sourceHighlight.Parent = Workspace
+        activeMoveHighlight.sourceHighlight = sourceHighlight
+    end
+
+    -- If this game's board doesn't expose discoverable tile instances and
+    -- visual piece geometry isn't available, still show the destination over
+    -- the source piece as a visible fallback.
+    if not target and not activeMoveHighlight.marker and sourceVisual then
+        local anchorPart = findBillboardAnchor(sourceVisual)
+        if anchorPart then
+            local billboard = Instance.new("BillboardGui")
+            billboard.Name = "ChessBestMoveFallback"
+            billboard.Adornee = anchorPart
+            billboard.Size = UDim2.fromOffset(120, 32)
+            billboard.StudsOffset = Vector3.new(0, 3.2, 0)
+            billboard.AlwaysOnTop = true
+            billboard.Parent = PlayerGui
+
+            local text = Instance.new("TextLabel")
+            text.Size = UDim2.fromScale(1, 1)
+            text.BackgroundColor3 = Color3.fromRGB(20, 105, 55)
+            text.BackgroundTransparency = 0.1
+            text.BorderSizePixel = 0
+            text.Font = Enum.Font.GothamBold
+            text.Text = "MOVE TO " .. string.upper(recommendation.to)
+            text.TextColor3 = Color3.new(1, 1, 1)
+            text.TextScaled = true
+            text.Parent = billboard
+
+            local textCorner = Instance.new("UICorner")
+            textCorner.CornerRadius = UDim.new(0, 7)
+            textCorner.Parent = text
+            activeMoveHighlight.fallbackBillboard = billboard
+        end
+    end
+end
+
 local gui = Instance.new("ScreenGui")
 gui.Name = "ChessAutoPlayerGUI"
 gui.ResetOnSpawn = false
@@ -1654,7 +2055,7 @@ gui.Parent = PlayerGui
 
 local main = Instance.new("Frame")
 main.Name = "Main"
-main.Size = UDim2.fromOffset(382, 390)
+main.Size = UDim2.fromOffset(382, 430)
 main.Position = UDim2.new(config.XScale, config.XOffset, config.YScale, config.YOffset)
 main.BackgroundColor3 = Color3.fromRGB(16, 17, 22)
 main.BorderSizePixel = 0
@@ -1790,14 +2191,21 @@ local simulateMoveDelayToggle = makeToggle(138, "Simulate move delay", state.Sim
     saveConfig()
 end)
 
-local delayModeLabel = makeLabel(main, UDim2.fromOffset(16, 174), UDim2.fromOffset(125, 24), "Delay mode", 11, Color3.fromRGB(190, 196, 210))
+local highlightBestMoveToggle = makeToggle(176, "Highlight best move", state.HighlightBestMove, function(enabled)
+    state.HighlightBestMove = enabled
+    config.HighlightBestMove = enabled
+    refreshBestMoveHighlight(state.Recommendation)
+    saveConfig()
+end)
+
+local delayModeLabel = makeLabel(main, UDim2.fromOffset(16, 212), UDim2.fromOffset(125, 24), "Delay mode", 11, Color3.fromRGB(190, 196, 210))
 
 delayModeLabel.TextYAlignment = Enum.TextYAlignment.Center
 
 local function makeModeButton(text, x)
     local button = Instance.new("TextButton")
     button.Size = UDim2.fromOffset(92, 25)
-    button.Position = UDim2.fromOffset(x, 171)
+    button.Position = UDim2.fromOffset(x, 209)
     button.BackgroundColor3 = Color3.fromRGB(48, 50, 59)
     button.BorderSizePixel = 0
     button.AutoButtonColor = false
@@ -1816,9 +2224,9 @@ end
 local randomModeButton = makeModeButton("Random", 151)
 local fixedModeButton = makeModeButton("Fixed", 251)
 
-local delayMinLabel = makeLabel(main, UDim2.fromOffset(108, 199), UDim2.fromOffset(86, 14), "Min (s)", 9, Color3.fromRGB(130, 138, 155))
-local delayMaxLabel = makeLabel(main, UDim2.fromOffset(232, 199), UDim2.fromOffset(86, 14), "Max (s)", 9, Color3.fromRGB(130, 138, 155))
-local delayFixedLabel = makeLabel(main, UDim2.fromOffset(108, 199), UDim2.fromOffset(150, 14), "Fixed delay (s)", 9, Color3.fromRGB(130, 138, 155))
+local delayMinLabel = makeLabel(main, UDim2.fromOffset(108, 237), UDim2.fromOffset(86, 14), "Min (s)", 9, Color3.fromRGB(130, 138, 155))
+local delayMaxLabel = makeLabel(main, UDim2.fromOffset(232, 237), UDim2.fromOffset(86, 14), "Max (s)", 9, Color3.fromRGB(130, 138, 155))
+local delayFixedLabel = makeLabel(main, UDim2.fromOffset(108, 237), UDim2.fromOffset(150, 14), "Fixed delay (s)", 9, Color3.fromRGB(130, 138, 155))
 
 local function makeDelayTextBox(position, size, initialText, placeholder)
     local box = Instance.new("TextBox")
@@ -1847,11 +2255,11 @@ local function makeDelayTextBox(position, size, initialText, placeholder)
     return box
 end
 
-local delayMinBox = makeDelayTextBox(UDim2.fromOffset(106, 214), UDim2.fromOffset(91, 27), tostring(config.MoveDelayMin), "Min")
-local delayDashLabel = makeLabel(main, UDim2.fromOffset(199, 214), UDim2.fromOffset(24, 27), "-", 14, Color3.fromRGB(190, 196, 210), Enum.TextXAlignment.Center)
+local delayMinBox = makeDelayTextBox(UDim2.fromOffset(106, 252), UDim2.fromOffset(91, 27), tostring(config.MoveDelayMin), "Min")
+local delayDashLabel = makeLabel(main, UDim2.fromOffset(199, 252), UDim2.fromOffset(24, 27), "-", 14, Color3.fromRGB(190, 196, 210), Enum.TextXAlignment.Center)
 delayDashLabel.TextYAlignment = Enum.TextYAlignment.Center
-local delayMaxBox = makeDelayTextBox(UDim2.fromOffset(225, 214), UDim2.fromOffset(91, 27), tostring(config.MoveDelayMax), "Max")
-local delayFixedBox = makeDelayTextBox(UDim2.fromOffset(106, 214), UDim2.fromOffset(210, 27), tostring(config.MoveDelayFixed), "Seconds")
+local delayMaxBox = makeDelayTextBox(UDim2.fromOffset(225, 252), UDim2.fromOffset(91, 27), tostring(config.MoveDelayMax), "Max")
+local delayFixedBox = makeDelayTextBox(UDim2.fromOffset(106, 252), UDim2.fromOffset(210, 27), tostring(config.MoveDelayFixed), "Seconds")
 
 local function refreshDelayModeUI()
     local randomMode = config.MoveDelayMode == "Random"
@@ -1906,15 +2314,15 @@ delayMaxBox.FocusLost:Connect(commitDelayFields)
 delayFixedBox.FocusLost:Connect(commitDelayFields)
 refreshDelayModeUI()
 
-local bestMoveLabel = makeLabel(main, UDim2.fromOffset(16, 250), UDim2.fromOffset(350, 23), "Best move: --", 12, Color3.fromRGB(225, 229, 238))
+local bestMoveLabel = makeLabel(main, UDim2.fromOffset(16, 288), UDim2.fromOffset(350, 23), "Best move: --", 12, Color3.fromRGB(225, 229, 238))
 bestMoveLabel.TextXAlignment = Enum.TextXAlignment.Left
 
-local searchStatusLabel = makeLabel(main, UDim2.fromOffset(16, 273), UDim2.fromOffset(350, 18), "Ready", 10, Color3.fromRGB(130, 138, 155))
+local searchStatusLabel = makeLabel(main, UDim2.fromOffset(16, 311), UDim2.fromOffset(350, 18), "Ready", 10, Color3.fromRGB(130, 138, 155))
 
-local menuKeyLabel = makeLabel(main, UDim2.fromOffset(16, 303), UDim2.fromOffset(120, 18), "Menu key", 10, Color3.fromRGB(130, 138, 155))
+local menuKeyLabel = makeLabel(main, UDim2.fromOffset(16, 341), UDim2.fromOffset(120, 18), "Menu key", 10, Color3.fromRGB(130, 138, 155))
 local menuKeyButton = Instance.new("TextButton")
 menuKeyButton.Size = UDim2.fromOffset(120, 22)
-menuKeyButton.Position = UDim2.fromOffset(246, 300)
+menuKeyButton.Position = UDim2.fromOffset(246, 338)
 menuKeyButton.BackgroundColor3 = Color3.fromRGB(25, 27, 34)
 menuKeyButton.BorderSizePixel = 0
 menuKeyButton.AutoButtonColor = false
@@ -1935,7 +2343,7 @@ keyStroke.Parent = menuKeyButton
 -- API cooldown explanation
 local cooldownExplanation = makeLabel(
     main,
-    UDim2.fromOffset(16, 331),
+    UDim2.fromOffset(16, 369),
     UDim2.fromOffset(350, 47),
     "During API cooldown a backup engine is used and Auto Ranked keeps running.",
     10,
@@ -2216,6 +2624,7 @@ local function analyzeCurrent(board)
 
     state.Recommendation = result
     updateAnalysisUI(result)
+    refreshBestMoveHighlight(result)
     return result
 end
 
@@ -2716,6 +3125,7 @@ state.Destroy = function()
     -- persistent settings when a fresh copy replaces it after teleport/re-exec.
     state.Destroyed = true
     state.PendingAccuracy = nil
+    clearMoveHighlight()
 
     pcall(function() gui:Destroy() end)
 end
@@ -2744,6 +3154,7 @@ task.spawn(function()
             state.LastAccuracyDisplayedSerial = 0
             state.CurrentGameId = gameId
             state.Recommendation = nil
+            clearMoveHighlight()
             state.AccuracySum = 0
             state.AccuracyCount = 0
             state.LastSnapshot = snapshot
@@ -2841,6 +3252,16 @@ task.spawn(function()
                     end
                 end
             end
+        end
+
+        -- Show only a recommendation for the current player-to-move position.
+        -- This update is independent of whether Auto Play is enabled.
+        local visibleRecommendation = state.Recommendation
+        if currentMatch and isPlayerTurn(currentMatch)
+            and visibleRecommendation and visibleRecommendation.key == key then
+            refreshBestMoveHighlight(visibleRecommendation)
+        else
+            refreshBestMoveHighlight(nil)
         end
 
         -- Accuracy runs after the live move analysis has had priority.
